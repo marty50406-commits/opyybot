@@ -1,0 +1,190 @@
+# web_server.py
+import os
+import asyncio
+from aiohttp import web
+from datetime import datetime
+import aiosqlite
+from tronpy import Tron
+
+# Load config from ENV
+TRON_FULL_NODE = os.getenv("TRON_FULL_NODE", "https://api.trongrid.io")
+TRON_PRIVATE_KEY = os.getenv("TRON_PRIVATE_KEY")
+DATABASE = os.getenv("DB_PATH", "bot_data.db")
+
+# Initialize Tron client
+tron_client = Tron(provider=TRON_FULL_NODE)
+
+# HTML template
+DEPOSIT_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>USDT Deposit - TRC20</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }}
+        h2 {{
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }}
+        .address-input {{
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: monospace;
+            background-color: #f9f9f9;
+            margin-bottom: 15px;
+        }}
+        .copy-btn {{
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+        }}
+        .qr-code {{
+            max-width: 200px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>💰 Send USDT (TRC20)</h2>
+        
+        <div class="address-section">
+            <div class="address-label">Wallet Address:</div>
+            <input id="addr" class="address-input" value="{address}" readonly>
+            <button class="copy-btn" onclick="copyAddress()">📋 Copy Address</button>
+        </div>
+
+        <div class="qr-section">
+            <div class="address-label">QR Code:</div>
+            <img id="qrCode" class="qr-code" src="" alt="QR Code">
+        </div>
+
+        <div class="instructions">
+            <h3>📱 How to Send USDT:</h3>
+            <ol>
+                <li>Copy the wallet address above</li>
+                <li>Open TronLink, Trust Wallet, or your preferred wallet</li>
+                <li>Select "Send" or "Transfer"</li>
+                <li>Choose USDT (TRC20) as the token</li>
+                <li>Paste the wallet address</li>
+                <li>Enter the amount you want to send</li>
+                <li>Confirm the transaction</li>
+            </ol>
+        </div>
+
+        <div class="warning">
+            ⚠️ <strong>Important:</strong> Only send USDT (TRC20) to this address.
+        </div>
+    </div>
+
+    <script>
+        function generateQRCode() {{
+            const address = document.getElementById('addr').value;
+            const qrCodeImg = document.getElementById('qrCode');
+            qrCodeImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${{encodeURIComponent(address)}}`;
+        }}
+
+        function copyAddress() {{
+            const addressInput = document.getElementById('addr');
+            navigator.clipboard.writeText(addressInput.value).then(function() {{
+                alert('Address copied to clipboard!');
+            }});
+        }}
+
+        window.onload = function() {{
+            generateQRCode();
+        }};
+    </script>
+</body>
+</html>
+"""
+
+async def get_user_deposit_address(user_id: int) -> str:
+    """Get or create deposit address for user"""
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT tron_deposit_addr FROM users WHERE telegram_id = ?", (user_id,))
+        row = await cur.fetchone()
+        
+        if row:
+            return row[0]
+        else:
+            # Generate new address for user
+            address = tron_client.get_address_from_private_key(TRON_PRIVATE_KEY).base58
+            await db.execute("INSERT OR REPLACE INTO users(telegram_id, tron_deposit_addr) VALUES (?, ?)",
+                           (user_id, address))
+            await db.commit()
+            return address
+
+async def deposit_page_handler(request):
+    """Handle deposit page requests"""
+    user_id = request.match_info.get('user_id')
+    
+    if not user_id:
+        return web.Response(text="User ID required", status=400)
+    
+    try:
+        user_id = int(user_id)
+        address = await get_user_deposit_address(user_id)
+        
+        html_content = DEPOSIT_HTML_TEMPLATE.format(address=address)
+        return web.Response(text=html_content, content_type='text/html')
+    
+    except ValueError:
+        return web.Response(text="Invalid user ID", status=400)
+    except Exception as e:
+        return web.Response(text=f"Error: {str(e)}", status=500)
+
+async def init_web_app():
+    """Initialize web application"""
+    app = web.Application()
+    app.router.add_get('/deposit/{user_id}', deposit_page_handler)
+    return app
+
+async def start_web_server(host='localhost', port=8080):
+    """Start the web server"""
+    app = await init_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    
+    print(f"Web server started at http://{host}:{port}")
+    print(f"Deposit page URL: http://{host}:{port}/deposit/{{user_id}}")
+    
+    return runner
+
+if __name__ == "__main__":
+    async def main():
+        runner = await start_web_server()
+        try:
+            await asyncio.Future()  # Run forever
+        except KeyboardInterrupt:
+            print("Shutting down server...")
+        finally:
+            await runner.cleanup()
+    
+    asyncio.run(main())
+    
